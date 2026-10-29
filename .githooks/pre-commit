@@ -1,0 +1,4 @@
+#!/bin/sh
+# Scan staged changes for secrets. If gitleaks is missing, exec fails and the
+# commit is blocked: same fail-closed rule as the engine.
+exec gitleaks git --pre-commit --staged --redact --verbose
