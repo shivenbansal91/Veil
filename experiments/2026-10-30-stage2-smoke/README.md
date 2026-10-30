@@ -88,3 +88,56 @@ Checked with `bench/check_recording.py`, which keeps every picture change and OC
 - **Random faults missed cases.** The first `--faults` used random rates. In 60 s it fired 3 garbage boxes and 4 slow frames, but no crash and no hang, so a run could pass without ever exercising the watchdog. Replaced by a fixed schedule (crash, garbage, two slow every 30 analysed frames; a 7 s hang at frame 25 and then every 100). The next 60 s run fired all four kinds, including one hang.
 - That the black frames during the hang come from the watchdog (rather than the following deadline miss) isn't separately confirmed from the recording; the unit test covers the watchdog path.
 - **Resize:** black from the first resize until ~3 s after the last one (a fresh gate starts black; the first full read at a new size misses the deadline; the retry approves it), then masked. No tracebacks.
+
+## 4. Live use on a real VS Code file (informal)
+
+Shiven ran `python -m engine --window <file>` on a dummy file open in VS Code and shared the protected view in Meet. This was informal: no receiver recording, nothing scored. It is a bug report, not a validation.
+
+Fake test file:
+
+```
+password= '#12345hello'
+api_key = 'hello1234sk-23455555'
+hello ji....
+password = 'hello123###'
+```
+
+Observed: it worked but lagged. Only the first password was masked. The `api_key` value and the second password stayed visible.
+
+**Diagnosis.** The rules match all three lines as plain text. `vscode_colours.py` draws the lines in VS Code Dark+ colours (name light blue, `=` grey, string orange) and runs them through the engine's RapidOCR:
+
+- RapidOCR splits a line where its colour changes. `api_key` and `= '...'` come back as two pieces, and the KEY=value rule needs both.
+- At 14–15 px it drops the `=` entirely (`api_key`, then `'hello1234sk-23455555'`).
+- At 21 px the pieces overlap and the `d` is read twice (`password`, then `d = 'hello123###'`).
+- The first line, `password=` with no space, stays one piece; that is why it was the only one masked.
+
+**Fix:**
+1. `secret_boxes` joins OCR pieces that share a row, left to right, before running the rules. Characters a piece repeats from the one before it are dropped, using the per-character boxes.
+2. The assignment rule also accepts a quoted value directly after a secret-ish name with no `=`. An unquoted word after the name still doesn't count (`password manager settings`).
+3. Regression tests: `test_name_and_value_split_by_syntax_colours_are_joined`, `test_overlapping_pieces_do_not_repeat_characters`, `test_pieces_on_different_rows_are_not_joined`, `test_quoted_value_after_a_secret_name_is_found_when_ocr_drops_the_equals`.
+
+| Font | Masked before | Masked after |
+|---|---|---|
+| 14 px | 2/3 | 3/3 |
+| 15 px | 1/3 | 3/3 |
+| 18 px | 2/3 | 3/3 |
+| 21 px | 1/3 | 3/3 |
+
+VEIL-Bench seed 1 after the fix (`python -m bench.run --ocr`), against §1:
+
+| Session | Deadline | Leaked frames | False-masked (before → after) |
+|---|---|---|---|
+| editor | none | 0/30 | 0.002 → 0.003 |
+| editor | 500 ms | 0/30 | 0.050 → 0.051 |
+| terminal | none | 0/27 | 0.004 → 0.004 |
+| terminal | 500 ms | 0/27 | 0.045 → 0.045 |
+
+**Not shown:**
+- The fix in real VS Code. Only the drawn imitation was tested; Shiven's live retest is pending.
+- Other themes and fonts.
+- Pieces from two side-by-side panes on the same row are now joined too. That can only add masks, never remove one, but it isn't measured.
+- The bench's own scenarios use one colour per line. That is why the bench never caught this: it needs a syntax-coloured scenario.
+
+## Stage 2 status
+
+**Not passed.** The pipeline runs and masks its own output locally, including under the scripted faults. The pass condition is still open: a recorded Meet receiver, scored with `bench/check_recording.py` per `docs/stage2-meet-test.md`. Until that is done, real-time protection is unvalidated (principle 9).

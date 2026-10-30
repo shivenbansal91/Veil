@@ -55,7 +55,7 @@ class ScreenDetector:
 
 def secret_boxes(lines: list[Line]) -> list[Box]:
     boxes = []
-    for line in lines:
+    for line in _join_rows(lines):
         # several rules often fire on one token (format, KEY= name, entropy): merge them
         spans: list[list[int]] = []
         for m in sorted(find_secrets(line.text)):
@@ -65,6 +65,57 @@ def secret_boxes(lines: list[Line]) -> list[Box]:
                 spans.append([m.start, m.end])
         boxes += [_span_box(line, start, end) for start, end in spans]
     return boxes
+
+
+def _join_rows(lines: list[Line]) -> list[Line]:
+    """OCR splits a line where its colour changes, so syntax highlighting gives
+    `api_key` and `= 'value'` as two pieces and no KEY=value rule sees both.
+    Join the pieces that share a row, left to right."""
+    rows: list[list[Line]] = []
+    for line in sorted(lines, key=lambda ln: ln.box[0]):
+        for row in rows:
+            if _same_row(row[-1].box, line.box):
+                row.append(line)
+                break
+        else:
+            rows.append([line])
+    return [_join(row) for row in rows]
+
+
+def _same_row(a: Box, b: Box) -> bool:
+    overlap = min(a[3], b[3]) - max(a[1], b[1])
+    return overlap > min(a[3] - a[1], b[3] - b[1]) / 2
+
+
+def _join(pieces: list[Line]) -> Line:
+    text, (x0, y0, x1, y1), chars = pieces[0]
+    if chars is not None and len(chars) != sum(not c.isspace() for c in text):
+        chars = None
+    for piece in pieces[1:]:
+        ptext, pchars = piece.text, piece.chars
+        nonspace = [i for i, c in enumerate(ptext) if not c.isspace()]
+        if chars is not None and pchars is not None and len(pchars) == len(nonspace):
+            # overlapping pieces repeat the shared characters (`password` then
+            # `d = '...'`): drop the ones whose centre is inside what's joined so far
+            k = 0
+            while k < len(pchars) and (pchars[k][0] + pchars[k][2]) / 2 < x1:
+                k += 1
+            if k == len(pchars):
+                continue
+            ptext, pchars, left = ptext[nonspace[k] :], pchars[k:], pchars[k][0]
+        else:
+            chars, left = None, piece.box[0]
+        char_w = (x1 - x0) / max(len(text), 1)
+        text += (" " if left - x1 > char_w / 2 else "") + ptext
+        if chars is not None:
+            chars = chars + pchars
+        x0, y0, x1, y1 = (
+            min(x0, piece.box[0]),
+            min(y0, piece.box[1]),
+            max(x1, piece.box[2]),
+            max(y1, piece.box[3]),
+        )
+    return Line(text, (x0, y0, x1, y1), chars)
 
 
 def _span_box(line: Line, start: int, end: int) -> Box:

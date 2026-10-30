@@ -100,6 +100,35 @@ def test_span_maps_to_its_characters_with_slack():
     assert box[0] > 3 * 10  # "A=xxxxxxxx" stays visible
 
 
+def piece(text, x0, y0=0, char_w=10):
+    """An OCR piece with evenly spaced character boxes, starting at x0."""
+    chars, x = [], x0
+    for c in text:
+        if not c.isspace():
+            chars.append((x, y0, x + char_w - 1, y0 + 20))
+        x += char_w
+    return Line(text, (x0, y0, x, y0 + 20), chars)
+
+
+def test_name_and_value_split_by_syntax_colours_are_joined():
+    # VS Code colours `api_key` and the string differently; OCR returns two pieces
+    text = "= 'hello1234sk-23455555'"
+    (box,) = secret_boxes([piece(text, 90), piece("api_key", 0)])
+    # the value, between the quotes: from its first character to its last
+    assert 100 < box[0] <= 90 + 10 * 3 and box[2] >= 90 + 10 * (len(text) - 2) + 9
+
+
+def test_overlapping_pieces_do_not_repeat_characters():
+    # 21 px Consolas: OCR read `password` and `d = 'hello123###'`, the d twice
+    text = "d = 'hello123###'"
+    (box,) = secret_boxes([piece("password", 0), piece(text, 70)])
+    assert 80 < box[0] <= 70 + 10 * 5 and box[2] >= 70 + 10 * (len(text) - 2) + 9
+
+
+def test_pieces_on_different_rows_are_not_joined():
+    assert secret_boxes([piece("api_key", 0, y0=0), piece("= 'hello1234sk-23455555'", 90, y0=40)]) == []
+
+
 def test_char_count_mismatch_masks_the_whole_line():
     text = "GITHUB_TOKEN=" + TOKEN
     (box,) = secret_boxes([Line(text, (5, 6, 300, 25), [(0, 0, 1, 1)] * 3)])

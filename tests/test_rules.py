@@ -43,6 +43,12 @@ def test_second_half_of_a_wrapped_token_is_found():
     assert secret_spans(tail)
 
 
+def test_quoted_value_after_a_secret_name_is_found_when_ocr_drops_the_equals():
+    # VS Code, 14-15 px: OCR read `api_key` and `'hello1234sk-23455555'`, no `=`
+    assert secret_spans("api_key 'hello1234sk-23455555'") == {"hello1234sk-23455555"}
+    assert find_secrets("password manager settings") == []  # unquoted: prose, not a value
+
+
 @pytest.mark.parametrize("line", FILLER + TERMINAL_FILLER)
 def test_bench_filler_is_not_flagged(line):
     assert find_secrets(line) == []

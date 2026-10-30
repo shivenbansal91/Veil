@@ -32,8 +32,11 @@ RULES = [
         "assignment",
         (
             r"(?i:[A-Za-z0-9_.-]*(?:password|passwd|pwd|secret|token|api_?key|access_?key|private_?key))"
+            # OCR can drop a thin `=` between syntax-coloured pieces; a quoted
+            # value right after the name still counts, an unquoted word doesn't
+            r"(?:[\"']?\s*[=:]\s*[\"']?|\s+[\"'])"
             # the value must end the token, so `pwd = os.environ[...]` is code, not a value
-            r"[\"']?\s*[=:]\s*[\"']?(?P<s>[^\s\"'()\[\]{}]{6,})(?=[\s\"',;]|$)"
+            r"(?P<s>[^\s\"'()\[\]{}]{6,})(?=[\s\"',;]|$)"
         ),
     ),
 ]
