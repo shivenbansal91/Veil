@@ -56,10 +56,13 @@ class Gate:
         deadline_s: float,
         clock: Callable[[], float] = time.monotonic,
         on_miss: OutputKind = OutputKind.FREEZE,
+        hang_s: float = 5.0,
     ):
         if on_miss not in (OutputKind.FREEZE, OutputKind.BLACKOUT):
             raise ValueError(f"on_miss must be FREEZE or BLACKOUT, not {on_miss}")
         self._detect = detect
+        self._hang_s = hang_s
+        self._busy_since: float | None = None  # clock reading when the in-flight submit() began
         self._width, self._height = size
         self._deadline_s = deadline_s
         self._clock = clock
@@ -87,7 +90,12 @@ class Gate:
 
         Safe to call from the output thread while submit() runs on another:
         _output is read once, and it only ever points at a finished safe frame.
+        A submit() stuck longer than hang_s (a hung detector never returns, so
+        submit() can't time itself out) turns the freeze into blackout.
         """
+        busy_since = self._busy_since
+        if busy_since is not None and self._clock() - busy_since > self._hang_s:
+            return self._blackout
         frame = self._output
         if frame.kind is OutputKind.APPROVED:
             states = self._states[frame.source_id]
@@ -96,6 +104,13 @@ class Gate:
         return frame
 
     def submit(self, raw: RawFrame) -> OutgoingFrame:
+        self._busy_since = self._clock()
+        try:
+            return self._submit(raw)
+        finally:
+            self._busy_since = None
+
+    def _submit(self, raw: RawFrame) -> OutgoingFrame:
         states = self._states[raw.id] = [FrameState.CAPTURED, FrameState.ANALYZING]
         try:
             masked = self._masked_copy(raw)
@@ -129,10 +144,12 @@ class Gate:
             raise ValueError(
                 f"frame {raw.id} is {raw.pixels.shape} {raw.pixels.dtype}, gate expects {expected} uint8"
             )
-        # Copy before detection: the output is the frame that was analysed, and
-        # it can never alias a capture buffer that gets reused later.
+        # Copy before detection, and detect on the copy: capture may reuse its
+        # buffer mid-detection, so the live buffer is not what will be sent.
         out = raw.pixels.copy()
-        for box in self._detect(raw):
+        analysed = out.view()
+        analysed.flags.writeable = False  # detectors must not draw on the output
+        for box in self._detect(RawFrame(raw.id, raw.captured_at, analysed)):
             x0, y0, x1, y1 = _pixel_box(box, self._width, self._height)
             out[y0:y1, x0:x1] = 0
         return out

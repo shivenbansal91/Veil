@@ -27,6 +27,8 @@ The approved frame's pixels are a **new array**, never a view of `raw.pixels`, e
 
 Why: numpy slicing and many "return the input unchanged" shortcuts produce views that share memory. If the output shares memory with a raw buffer, then when capture reuses or overwrites that buffer, raw pixels appear in the output without ever passing through the gate. That's a leak with no bug in the gate's logic, which makes it the worst kind. The tests check `np.shares_memory` and that writing to output pixels raises.
 
+The detector runs on a **read-only view of that copy**, not on `raw.pixels` (fixed 2026-10-30, found while planning capture). Otherwise a capture library that reuses its buffer can overwrite it mid-detection: the detector finds boxes for the new content while the copy, which is what gets sent, still holds the old content and its secrets. Read-only also stops in-place preprocessing in a detector from drawing on the output; such a write raises, which is an error, which is blackout. Tests: `test_detector_analyses_the_pixels_that_are_sent`, `test_detector_cannot_write_into_the_output`.
+
 ### 3. Default deny: every non-success path ends at a pre-made safe frame
 
 - Before the first approval: `BLACKOUT`.
@@ -56,8 +58,8 @@ Boxes are half-open: `(x0, y0, x1, y1)` covers `x0 <= x < x1`, `y0 <= y < y1`, t
 
 `submit()` runs detection inline and returns. That makes every test deterministic, which is the right first step. What it can't do:
 
-- **Hung detector:** `submit()` never returns. Readers on another thread keep getting the last safe frame (tested: `test_hung_detector_never_exposes_the_frame_in_flight`), which is an indefinite freeze. Nothing switches it to blackout after a while; whether a long freeze should become blackout is a product decision for Stage 2's watchdog.
-- **Process crash:** the protected window must go black when the engine dies. That's a property of the output side (Stage 2).
+- **Hung detector:** `submit()` never returns, so it can't time itself out. Readers on another thread keep getting the last safe frame (`test_hung_detector_never_exposes_the_frame_in_flight`), and once a submit has been in flight longer than `hang_s` (default 5 s, above the ~3.7 s worst case measured for full-frame OCR during scrolls), `publish()` returns blackout instead (`test_detector_hung_past_hang_s_blacks_out_then_recovers`). A slow submit that finishes never triggers it (`test_slow_but_finished_submits_never_trigger_the_hang_blackout`). Added 2026-10-30, Stage 2.
+- **Process crash:** the protected window lives in the engine's process, so a crash removes the window rather than painting black. What the meeting shows then is untested (needs the Meet test). If only the engine thread dies, the window paints black (`engine/__main__.py`).
 - `POLICY_DENY` arrives with private apps in Stage 6.
 
 ### 8. PUBLISHED is set by the reader, not the gate
@@ -70,11 +72,12 @@ The output adapter calls `gate.publish()` for each frame it shows. That returns 
 from engine.gate import FrameState, Gate, OutgoingFrame, OutputKind, RawFrame
 
 RawFrame(id: int, captured_at: float, pixels: np.ndarray)   # H x W x 3 uint8
-Gate(detect, *, size=(width, height), deadline_s, clock=time.monotonic, on_miss=OutputKind.FREEZE)
+Gate(detect, *, size=(width, height), deadline_s, clock=time.monotonic, on_miss=OutputKind.FREEZE, hang_s=5.0)
     detect: Callable[[RawFrame], Iterable[tuple[number, number, number, number]]]
 gate.submit(raw) -> OutgoingFrame        # also becomes gate.output
 gate.output -> OutgoingFrame             # read-only property: what is shown now
-gate.publish() -> OutgoingFrame          # output adapter takes the frame to show; marks PUBLISHED
+gate.publish() -> OutgoingFrame          # output adapter takes the frame to show; marks PUBLISHED;
+                                         # blackout while a submit() is stuck past hang_s
 gate.states(frame_id) -> list[FrameState]
 OutgoingFrame.kind: OutputKind           # APPROVED | FREEZE | BLACKOUT
 OutgoingFrame.source_id: int | None      # id of the approved frame shown; None for blackout

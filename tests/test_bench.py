@@ -1,12 +1,16 @@
 """Stage 1 acceptance: the scorer finds planted secrets in raw output and is not fooled."""
 
+import random
+import string
+
 import numpy as np
 import pytest
+from PIL import Image, ImageDraw
 
 from bench.run import gate_pipeline
 from bench.run import run as timed_run
-from bench.scenario import editor_session, terminal_session
-from bench.score import LEAK_INK_FRACTION, black_everything, no_protection, oracle_mask, score, surviving_ink
+from bench.scenario import FONT, editor_session, terminal_session
+from bench.score import black_everything, no_protection, oracle_mask, readable, score
 
 SESSIONS = {"editor": editor_session, "terminal": terminal_session}
 
@@ -111,7 +115,36 @@ def test_half_masked_secret_is_a_leak(session):
     mid = (s.rect.x0 + s.rect.x1) // 2
     out[s.rect.y0 : s.rect.y1, s.rect.x0 : mid] = 0
     region = (slice(s.rect.y0, s.rect.y1), slice(s.rect.x0, s.rect.x1))
-    assert surviving_ink(frame.pixels[region], out[region], s.ink) > LEAK_INK_FRACTION
+    assert readable(frame.pixels[region], out[region], s.ink, len(s.value))
+    assert score([frame], [out]).leaked_frames == 1
+
+
+def test_mask_two_chars_short_is_not_scored_readable(session):
+    # a mask that leaves a sliver of one character uncovered: not a readable leak
+    frame = next(f for f in session if f.secrets)
+    s = frame.secrets[0]
+    out = frame.pixels.copy()
+    cell = (s.rect.x1 - s.rect.x0) / len(s.value)
+    out[s.rect.y0 : s.rect.y1, s.rect.x0 : s.rect.x1 - int(1.5 * cell)] = 0
+    region = (slice(s.rect.y0, s.rect.y1), slice(s.rect.x0, s.rect.x1))
+    assert not readable(frame.pixels[region], out[region], s.ink, len(s.value))
+
+
+def test_other_text_in_the_same_colour_at_the_secret_spot_is_not_a_leak():
+    # found via VEIL-Bench: a frozen terminal frame showed different text, same
+    # colour, where the current secret sits; ~8% of glyph pixels coincided
+    rng = random.Random(0)
+    for frame in terminal_session(seed=3, n_frames=30, size=(1280, 720)):
+        if not frame.secrets:
+            continue
+        img = Image.fromarray(frame.pixels.copy())
+        draw = ImageDraw.Draw(img)
+        for s in frame.secrets:
+            draw.rectangle([s.rect.x0, s.rect.y0, s.rect.x1 - 1, s.rect.y1 - 1], fill=(12, 12, 12))
+            bx0, by0, _, _ = FONT.getbbox(s.value)
+            other = "".join(rng.choices(string.ascii_letters + string.digits, k=len(s.value)))
+            draw.text((s.rect.x0 - bx0, s.rect.y0 - by0), other, font=FONT, fill=(204, 204, 204))
+        assert score([frame], [np.asarray(img)]).leaked_frames == 0
 
 
 def test_frozen_output_showing_an_older_unmasked_frame_is_caught(session):
@@ -159,6 +192,18 @@ def test_gate_with_a_perfect_detector_leaks_nothing_on_either_scenario():
         assert result.score.leaked_frames == 0 and result.score.mean_false_mask == 0
 
 
+def test_short_wrapped_fragment_counts_when_fully_visible():
+    # the terminal JWT wraps leaving "8q" on its own row: 2 chars can never make a
+    # 3-char run, so a fully visible short part must count on its own
+    frames = terminal_session(seed=7, n_frames=30)
+    frame, part = next((f, s) for f in frames for s in f.secrets if len(s.value) < 3)
+    region = (slice(part.rect.y0, part.rect.y1), slice(part.rect.x0, part.rect.x1))
+    assert readable(frame.pixels[region], frame.pixels[region], part.ink, len(part.value))
+    masked = frame.pixels.copy()
+    masked[region] = 0
+    assert not readable(frame.pixels[region], masked[region], part.ink, len(part.value))
+
+
 def test_blank_ink_never_counts_as_a_leak():
     blank = np.full((10, 10, 3), 30, dtype=np.uint8)
-    assert surviving_ink(blank, blank, np.zeros((10, 10), dtype=bool)) == 0.0
+    assert not readable(blank, blank, np.zeros((10, 10), dtype=bool), 3)

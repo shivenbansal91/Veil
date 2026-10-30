@@ -7,6 +7,7 @@ Run: .venv\\Scripts\\python -m bench.run
 """
 
 import statistics
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -66,12 +67,17 @@ def gate_pipeline(
 
 
 def main() -> None:
+    with_ocr = "--ocr" in sys.argv  # slow, needs the GPU: off by default
+    if with_ocr:
+        from engine.detect.ocr import ScreenDetector, rapidocr
+
+        ocr = rapidocr({"EngineConfig.onnxruntime.use_cuda": True})
     sessions = {
         "editor": editor_session(seed=1, n_frames=30, size=(1920, 1080)),
         "terminal": terminal_session(seed=1, n_frames=30, size=(1920, 1080)),
     }
     print(
-        f"{'session':<9} {'pipeline':<22} {'leaked':>8} {'false-mask':>10} {'p50 ms':>8} {'p95 ms':>8} {'fps':>8}"
+        f"{'session':<9} {'pipeline':<30} {'leaked':>8} {'false-mask':>10} {'p50 ms':>8} {'p95 ms':>8} {'fps':>8}"
     )
     for name, session in sessions.items():
         size = session[0].pixels.shape[1::-1]
@@ -81,11 +87,15 @@ def main() -> None:
             "oracle mask": oracle_mask,
             "gate + oracle detector": gate_pipeline(lambda f: [s.rect for s in f.secrets], size),
         }
+        if with_ocr:
+            # no deadline: what detection alone misses; 500 ms: what the live gate would send
+            pipelines["gate + OCR/rules, no deadline"] = gate_pipeline(ScreenDetector(ocr), size, 1e9)
+            pipelines["gate + OCR/rules, 500 ms"] = gate_pipeline(ScreenDetector(ocr), size, 0.5)
         for label, pipeline in pipelines.items():
             r = run(session, pipeline)
             s = r.score
             print(
-                f"{name:<9} {label:<22} {s.leaked_frames:>3}/{s.secret_frames:<4} {s.mean_false_mask:>10.3f} "
+                f"{name:<9} {label:<30} {s.leaked_frames:>3}/{s.secret_frames:<4} {s.mean_false_mask:>10.3f} "
                 f"{r.p50_ms:>8.2f} {r.p95_ms:>8.2f} {r.fps:>8.0f}"
             )
 

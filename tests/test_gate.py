@@ -78,6 +78,34 @@ def test_output_never_shares_memory_with_raw():
     assert np.array_equal(out.pixels, before)
 
 
+def test_detector_analyses_the_pixels_that_are_sent():
+    """Capture reuses its buffer: a new frame lands in raw.pixels mid-detection.
+    The detector must see the copy that becomes the output, not the live buffer."""
+    clock = FakeClock()
+    frame = raw(1, clock, np.full((H, W, 3), 30, dtype=np.uint8))
+    frame.pixels[10:20, 10:30] = 255  # a "secret" in the captured frame
+
+    def overwritten_then_detect(analysed):
+        frame.pixels[:] = 30  # next capture: the secret is gone from the buffer
+        ys, xs = np.nonzero(analysed.pixels[:, :, 0] == 255)
+        return [(xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)] if len(xs) else []
+
+    out = make_gate(overwritten_then_detect, clock).submit(frame)
+    assert out.kind == OutputKind.APPROVED
+    assert not (out.pixels == 255).any()
+
+
+def test_detector_cannot_write_into_the_output():
+    clock = FakeClock()
+
+    def scribbles(analysed):
+        analysed.pixels[0, 0] = 255  # e.g. in-place OCR preprocessing
+        return []
+
+    out = make_gate(scribbles, clock).submit(raw(1, clock, np.zeros((H, W, 3), dtype=np.uint8)))
+    assert out.kind == OutputKind.BLACKOUT  # the write raised; error means blackout
+
+
 def test_output_never_shares_memory_with_raw_even_with_nothing_to_mask():
     clock = FakeClock()
     frame = raw(1, clock)
@@ -324,6 +352,47 @@ def test_hung_detector_never_exposes_the_frame_in_flight():
     release.set()
     worker.join(timeout=5)
     assert not worker.is_alive()
+
+
+def test_detector_hung_past_hang_s_blacks_out_then_recovers():
+    clock = FakeClock()
+    entered, release = threading.Event(), threading.Event()
+    detect = {"current": boxes()}
+
+    def hang(frame):
+        entered.set()
+        release.wait(timeout=5)
+        return []
+
+    gate = make_gate(lambda f: detect["current"](f), clock, hang_s=2.0)
+    approved = gate.submit(raw(1, clock))
+    detect["current"] = hang
+    worker = threading.Thread(target=gate.submit, args=(raw(2, clock),))
+    worker.start()
+    assert entered.wait(timeout=5)
+
+    clock.now += 2.0
+    assert gate.publish() is approved  # exactly hang_s: still a freeze
+    clock.now += 0.01
+    out = gate.publish()
+    assert out.kind == OutputKind.BLACKOUT and is_black(out)
+
+    release.set()
+    worker.join(timeout=5)
+    detect["current"] = boxes()
+    late = gate.publish()  # frame 2 finished 2 s after capture: past the deadline
+    assert late.kind == OutputKind.FREEZE and late.source_id == 1
+    assert gate.submit(raw(3, clock)).kind == OutputKind.APPROVED
+    assert gate.publish().source_id == 3
+
+
+def test_slow_but_finished_submits_never_trigger_the_hang_blackout():
+    clock = FakeClock()
+    gate = make_gate(slow(DEADLINE / 2, clock), clock, hang_s=0.1)  # each submit takes longer than hang_s
+    for frame_id in range(3):
+        clock.now += 1
+        gate.submit(raw(frame_id, clock))
+        assert gate.publish().kind == OutputKind.APPROVED  # nothing is in flight now
 
 
 def test_fault_injection_never_transmits_unmasked_pixels():

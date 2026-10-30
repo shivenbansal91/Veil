@@ -1,6 +1,7 @@
 """Pixel-based leak scoring against scenario ground truth (CLAUDE.md §9.1).
 
-A secret leaks in an output frame if enough of its ink pixels survive unchanged.
+A secret leaks in an output frame if READABLE_RUN consecutive characters of it
+survive: a character survives when nearly all its glyph pixels are unchanged.
 Two checks per output frame k:
 
 - Secrets on screen at k: are their ink pixels still in the output?
@@ -11,16 +12,19 @@ Two checks per output frame k:
 """
 
 from dataclasses import dataclass
+from itertools import pairwise
 
 import numpy as np
 
-from bench.scenario import Frame, Rect
+from bench.scenario import Frame, Rect, Secret
 
-# Share of a secret's ink pixels that must survive for it to count as leaked.
-# Above 0 because unrelated text drawn at the same spot shares a few
-# anti-aliased pixel values by coincidence; low enough that a half-masked token
-# (about half its characters readable) is still a leak. Tested both ways.
-LEAK_INK_FRACTION = 0.05
+# Counted per character, not per pixel: a frozen frame can show other text in
+# the same colour where a secret sits, and ~8% of glyph pixels then match by
+# coincidence (found in the terminal scenario). Unrelated text almost never
+# reproduces 3 of the secret's glyphs in a row at the same place; a half-masked
+# token keeps ~20. Tested both ways, and a 1-2 char sliver doesn't count.
+READABLE_RUN = 3
+CHAR_SURVIVES = 0.9  # share of a character's glyph pixels that must be unchanged
 
 
 @dataclass
@@ -46,28 +50,44 @@ class Score:
         return sum(self.false_mask) / self.frames
 
 
-def surviving_ink(
-    raw_region: np.ndarray, out_region: np.ndarray, ink: np.ndarray, unexplained: np.ndarray | None = None
-) -> float:
-    """Share of the secret's ink pixels that are identical in the output,
-    counting only pixels in `unexplained` when given."""
-    if not ink.any():
-        return 0.0
+def readable(
+    raw_region: np.ndarray,
+    out_region: np.ndarray,
+    ink: np.ndarray,
+    n_chars: int,
+    unexplained: np.ndarray | None = None,
+) -> bool:
+    """READABLE_RUN consecutive characters survive in the output, or all of them
+    for a part shorter than that (a wrapped token can leave 2 chars on a row).
+    Counts only pixels in `unexplained` when given. Cells are equal slices of
+    the box, which matches a monospaced font."""
     same = np.all(raw_region == out_region, axis=-1)
     if unexplained is not None:
         same &= unexplained
-    return float((ink & same).sum() / ink.sum())
+    edges = np.linspace(0, ink.shape[1], n_chars + 1).round().astype(int)
+    best = run = visible = 0
+    for a, b in pairwise(edges):
+        glyph = ink[:, a:b]
+        if not glyph.any():
+            continue  # hidden (e.g. under a toast) or a space: neither breaks nor extends a run
+        visible += 1
+        if (glyph & same[:, a:b]).sum() >= CHAR_SURVIVES * glyph.sum():
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    return visible > 0 and best >= min(READABLE_RUN, visible)
 
 
 def score(session: list[Frame], outputs: list[np.ndarray]) -> Score:
     """Score output frames; outputs[k] is what was transmitted while session[k] was on screen."""
-    occurrences: dict[tuple[str, Rect], tuple[np.ndarray, np.ndarray]] = {}
+    occurrences: dict[tuple[str, Rect], tuple[np.ndarray, Secret]] = {}
     for frame in session:
         for s in frame.secrets:
             seen = occurrences.get((s.kind, s.rect))
             # keep the most visible copy: the same spot may be half under a toast in one frame
-            if seen is None or s.ink.sum() > seen[1].sum():
-                occurrences[s.kind, s.rect] = (frame.pixels[_slice(s.rect)], s.ink)
+            if seen is None or s.ink.sum() > seen[1].ink.sum():
+                occurrences[s.kind, s.rect] = (frame.pixels[_slice(s.rect)], s)
 
     leaks, false_mask = [], []
     for raw, out in zip(session, outputs, strict=True):
@@ -75,14 +95,14 @@ def score(session: list[Frame], outputs: list[np.ndarray]) -> Score:
         leaked = {
             s.kind
             for s in raw.secrets
-            if surviving_ink(raw.pixels[_slice(s.rect)], out[_slice(s.rect)], s.ink) > LEAK_INK_FRACTION
+            if readable(raw.pixels[_slice(s.rect)], out[_slice(s.rect)], s.ink, len(s.value))
         }
         unexplained = np.any(out != raw.pixels, axis=-1)
         leaked |= {
             kind
-            for (kind, rect), (region, ink) in occurrences.items()
+            for (kind, rect), (region, past) in occurrences.items()
             if (kind, rect) not in on_screen
-            and surviving_ink(region, out[_slice(rect)], ink, unexplained[_slice(rect)]) > LEAK_INK_FRACTION
+            and readable(region, out[_slice(rect)], past.ink, len(past.value), unexplained[_slice(rect)])
         }
         leaks.append(leaked)
         outside = np.ones(raw.pixels.shape[:2], dtype=bool)
